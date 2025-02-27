@@ -1,0 +1,43 @@
+name: Build and Push Docker Image
+
+on:
+  workflow_run:
+    workflows: ["kpress-template-service-ci"]
+    types:
+      - completed
+
+jobs:
+  build-and-push:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_ACCESS_TOKEN }}
+
+      - name: Load environment variables from .env
+        id: load_env
+        run: |
+          echo "PORT=$(grep PORT .env | cut -d '=' -f2)" >> $GITHUB_ENV
+          echo "DB_PORT=$(grep DB_PORT .env | cut -d '=' -f2)" >> $GITHUB_ENV
+
+      - name: Build and push Docker image for multiple platforms
+        uses: docker/build-push-action@v4w
+        with:
+          context: .
+          file: ./Dockerfile.prod
+          push: true
+          tags: ${{ secrets.DOCKER_USERNAME }}/kpress-app-template-service:latest
+          platforms: linux/amd64,linux/arm64
+          build-args: |
+            PORT=${{ env.PORT }}
+            DB_PORT=${{ env.DB_PORT }}
