@@ -1,150 +1,189 @@
-const express = require("express")
-const dotenv = require("dotenv")
-const pgp = require("pg-promise")()
-const amqp = require("amqplib/callback_api")
-const { v4: uuidv4 } = require("uuid")
-const app = express()
+require("dotenv").config();
+const express = require("express");
+const amqp = require("amqplib");
+const cors = require("cors");
+const morgan = require("morgan");
+const path = require("path");
+const sqlite3 = require("sqlite3").verbose();
+const knex = require("knex")({
+  client: "pg",
+  connection: process.env.DATABASE_URL,
+});
 
-dotenv.config()
+const app = express();
+app.use(express.json());
+app.use(cors({ origin: "*" }));
+app.use(morgan("dev"));
+
+// Global connection variables
+let rabbitMQConnection;
+let rabbitMQChannel;
 
 const connectToDatabase = async (retries = 5, delay = 5000) => {
   while (retries) {
     try {
-      const db = pgp(process.env.DATABASE_URL)
-      await db.connect()
-      console.log("Connected to the database")
+      await knex.raw("SELECT 1");
+      console.log("Connected to the database");
 
-      // Create the templates table if it doesn't exist
-      await db.none(`
-       CREATE TABLE IF NOT EXISTS templates (
-          id UUID PRIMARY KEY,
-          title VARCHAR(255) NOT NULL,
-          user_id INT NOT NULL,
-          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-          updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-          deleted_at TIMESTAMP
-        );
-        `)
-      console.log("Table 'templates' created successfully")
+      const exists = await knex.schema.hasTable("areas");
+      if (!exists) {
+        await knex.schema.createTable("areas", (table) => {
+          table.increments("id").primary();
+          table.string("name");
+          table.specificType("geom", "geometry(POLYGON, 4326)");
+        });
+        console.log("Table 'areas' created successfully");
+      }
 
-      return db
+      return knex;
     } catch (error) {
-      console.error("Failed to connect to the database, retrying...", error)
-      retries -= 1
-      await new Promise((res) => setTimeout(res, delay))
+      console.error("Failed to connect to the database, retrying...", error);
+      retries -= 1;
+      await new Promise((res) => setTimeout(res, delay));
     }
   }
-  throw new Error("Could not connect to the database after multiple attempts")
-}
+  throw new Error("Could not connect to the database after multiple attempts");
+};
 
-const connectToRabbitMQ = () => {
-  return new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => {
-      reject(new Error("RabbitMQ connection timeout"))
-    }, 5000) // 5 seconds timeout
+const connectToRabbitMQ = async () => {
+  try {
+    rabbitMQConnection = await amqp.connect(process.env.RABBITMQ_URL);
+    rabbitMQChannel = await rabbitMQConnection.createChannel();
+    console.log("Connected to RabbitMQ");
+    return { connection: rabbitMQConnection, channel: rabbitMQChannel };
+  } catch (error) {
+    console.error("Failed to connect to RabbitMQ:", error);
+    throw error;
+  }
+};
 
-    amqp.connect(process.env.RABBITMQ_URL, (error0, connection) => {
-      clearTimeout(timeout)
-      if (error0) {
-        reject(error0)
-      } else {
-        resolve(connection)
-      }
-    })
-  })
-}
+// Define the path to the MBTiles file
+const mbtilesPath = path.join(__dirname, "storage", "saudi.mbtiles");
 
-connectToDatabase()
-  .then((db) => {
-    app.use(express.json())
+app.get("/", (req, res) => {
+  res.json("gis service");
+});
 
-    app.get("/", (req, res) => {
-      res.json("template service")
-    })
+app.get("/api/tiles/:z/:x/:y.pbf", (req, res) => {
+  const { z, x, y } = req.params;
+  const tileY = (1 << z) - 1 - parseInt(y, 10);
 
-    connectToRabbitMQ()
-      .then((connection) => {
-        connection.createChannel((error1, channel) => {
-          if (error1) {
-            throw error1
+  console.log(`Fetching vector tile: z=${z}, x=${x}, y=${tileY}`);
+
+  const db = new sqlite3.Database(mbtilesPath, sqlite3.OPEN_READONLY, (err) => {
+    if (err) {
+      console.error("Error opening MBTiles database:", err);
+      return res.status(500).json({ error: "Error opening MBTiles file" });
+    }
+
+    db.get(
+      `SELECT tile_data FROM tiles WHERE zoom_level = ? AND tile_column = ? AND tile_row = ?`,
+      [parseInt(z, 10), parseInt(x, 10), tileY],
+      (err, row) => {
+        db.close((closeErr) => {
+          if (closeErr) {
+            console.error("Error closing database:", closeErr);
           }
-          const queue = "template_created"
+        });
 
-          channel.assertQueue(queue, {
-            durable: false,
-          })
+        if (err || !row) {
+          console.error(`Tile not found at z:${z}, x:${x}, y:${tileY}`, err);
+          return res.status(404).json({ error: "Tile not found" });
+        }
 
-          // Create a new template
-          app.post("/create", (req, res) => {
-            const { title, user_id } = req.body
-            if (!title || !user_id) {
-              return res.status(400).json({ error: "Title and user_id are required" })
-            }
-            const id = uuidv4()
-            db.none("INSERT INTO templates(id, title, user_id) VALUES($1, $2, $3, $4)", [id, title, user_id])
-              .then(() => {
-                res.status(201).json({ message: "Template created successfully" })
+        console.log(`Vector tile retrieved: ${z}/${x}/${y}, size=${row.tile_data.length} bytes`);
+        res.setHeader("Content-Type", "application/x-protobuf");
+        res.setHeader("Content-Encoding", "gzip");
+        res.send(row.tile_data);
+      }
+    );
+  });
+});
 
-                // Send message to RabbitMQ
-                const template = { id, title, user_id }
-                channel.sendToQueue(queue, Buffer.from(JSON.stringify(template)))
-                console.log(" [x] Sent %s", template)
-              })
-              .catch((error) => {
-                res.status(500).json({ error: error.message })
-              })
-          })
+app.post("/api/areas", async (req, res) => {
+  const { name, geojson } = req.body;
+  if (!name || !geojson) {
+    return res.status(400).json({ error: "Name and GeoJSON are required" });
+  }
 
-          // Read all templates
-          app.get("/all", (req, res) => {
-            db.any("SELECT * FROM templates WHERE deleted_at IS NULL")
-              .then((data) => {
-                res.status(200).json(data)
-              })
-              .catch((error) => {
-                res.status(500).json({ error: error.message })
-              })
-          })
+  console.log("Received GeoJSON:", JSON.stringify(geojson, null, 2));
 
-          // Update a template
-          app.patch("/template/:id", (req, res) => {
-            const { id } = req.params
-            const { title, user_id } = req.body
-
-            db.none("UPDATE templates SET title=$1, user_id=$2, updated_at=CURRENT_TIMESTAMP WHERE id=$3", [
-              title,
-              user_id,
-              id,
-            ])
-              .then(() => {
-                res.status(200).json({ message: "Template updated successfully" })
-              })
-              .catch((error) => {
-                res.status(500).json({ error: error.message })
-              })
-          })
-
-          // Delete a template
-          app.delete("/template/:id", (req, res) => {
-            const { id } = req.params
-            db.none("UPDATE templates SET deleted_at=CURRENT_TIMESTAMP WHERE id=$1", [id])
-              .then(() => {
-                res.status(204).json({ message: "Template deleted successfully" })
-              })
-              .catch((error) => {
-                res.status(500).json({ error: error.message })
-              })
-          })
-
-          app.listen(process.env.PORT, () => {
-            console.log(`Example app listening at ${process.env.APP_URL}:${process.env.PORT}`)
-          })
-        })
+  try {
+    const result = await knex("areas")
+      .insert({
+        name,
+        geom: knex.raw("ST_GeomFromGeoJSON(?)", [JSON.stringify(geojson.geometry)]),
       })
-      .catch((error) => {
-        console.error("Failed to connect to RabbitMQ:", error)
-      })
-  })
-  .catch((error) => {
-    console.error("Failed to start the server:", error)
-  })
+      .returning("*");
+    res.json(result[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/api/areas", async (req, res) => {
+  try {
+    const result = await knex("areas").select(
+      "id",
+      "name",
+      knex.raw("ST_AsGeoJSON(geom) as geojson")
+    );
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete("/api/areas", async (req, res) => {
+  try {
+    await knex("areas").del();
+    res.json({ message: "All AOIs removed successfully" });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Error handling middleware (placed after routes)
+app.use((err, req, res, next) => {
+  console.error(err.stack);
+  res.status(500).json({ error: "Something went wrong!" });
+});
+
+const PORT = process.env.PORT || 3000;
+
+async function startServer() {
+  try {
+    await connectToDatabase();
+    await connectToRabbitMQ();
+    const queue = "gis_created";
+    rabbitMQChannel.assertQueue(queue, { durable: false });
+
+    const server = app.listen(PORT, () => {
+      console.log(`Server listening at ${process.env.APP_URL || "http://localhost"}:${PORT}`);
+    });
+
+    // Graceful shutdown on termination signals
+    const gracefulShutdown = async () => {
+      console.log("Shutting down server...");
+      server.close();
+      if (rabbitMQConnection) {
+        try {
+          await rabbitMQConnection.close();
+        } catch (err) {
+          console.error("Error closing RabbitMQ connection:", err);
+        }
+      }
+      await knex.destroy();
+      process.exit(0);
+    };
+
+    process.on("SIGTERM", gracefulShutdown);
+    process.on("SIGINT", gracefulShutdown);
+
+  } catch (error) {
+    console.error("Failed to start the server:", error);
+    process.exit(1);
+  }
+}
+
+startServer();

@@ -19,25 +19,25 @@ services:
       timeout: 5s
       retries: 5
 
-  kpress-db-template:
-    image: postgres:latest
-    container_name: kpress-db-template
+  kpress-db-gis:
+    image: postgis/postgis:latest
+    container_name: kpress-db-gis
     environment:
       POSTGRES_USER: myuser
       POSTGRES_PASSWORD: mypassword
       POSTGRES_DB: mydb
     expose:
-      - "5434"
+      - ${DB_PORT}
     ports:
-      - "5434:5434"
+      - "${DB_PORT}:${DB_PORT}"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U myuser -d mydb -p 5434"]
+      test: ["CMD-SHELL", "pg_isready -U myuser -d mydb -p 5432"]
       interval: 10s
       timeout: 5s
       retries: 5
-    command: ["postgres", "-c", "port=5434"]
+    command: ["postgres", "-c", "port=5432"]
 
-  kpress-app-template-service:
+  kpress-app-gis-service:
     build:
       context: .
       dockerfile: Dockerfile.prod
@@ -46,7 +46,7 @@ services:
     ports:
       - "${PORT}:${PORT}"
     depends_on:
-      kpress-db-template:
+      kpress-db-gis:
         condition: service_healthy
       kpress-rabbitmq:
         condition: service_healthy

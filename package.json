@@ -1,5 +1,5 @@
 {
-  "name": "kpress-template",
+  "name": "kpress-gis",
   "version": "1.0.0",
   "main": "server.js",
   "author": "ru44",
@@ -10,6 +10,16 @@
     "test": "jest"
   },
   "dependencies": {
+    "canvas": "^3.1.0",
+    "knex": "^3.1.0",
+    "leaflet.vectorgrid": "^1.3.0",
+    "mapnik": "^4.5.9",
+    "pg": "^8.13.3",
+    "sqlite3": "^5.1.7",
+    "tilebelt": "^1.0.1",
+    "tileserver-gl": "^5.1.3",
+    "@mapbox/mbtiles": "^0.12.1",
+    "@mapbox/tilelive": "^6.1.2",
     "amqplib": "^0.10.5",
     "body-parser": "^1.20.3",
     "class-transformer": "^0.5.1",
@@ -27,7 +37,6 @@
     "module-alias": "^2.2.3",
     "morgan": "^1.10.0",
     "nanoid": "^5.1.2",
-    "node-webcam": "^0.8.2",
     "os": "^0.1.2",
     "pg-promise": "^11.10.2",
     "pino": "^9.6.0",
@@ -59,8 +68,11 @@
   "pnpm": {
     "onlyBuiltDependencies": [
       "@scarf/scarf",
-      "better-sqlite3",
-      "node-webcam"
+      "@maplibre/maplibre-gl-native",
+      "canvas",
+      "mapnik",
+      "sharp",
+      "sqlite3"
     ]
   }
 }
